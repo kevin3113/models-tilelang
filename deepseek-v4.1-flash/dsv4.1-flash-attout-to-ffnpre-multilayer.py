@@ -78,7 +78,7 @@ SEED = 0
 # is eager. Set to True to also try the compiled path.
 RUN_NPUGRAPH_EX = True
 
-ENABLE_SUPER_KERNEL = True
+ENABLE_SUPER_KERNEL = False
 
 if ENABLE_SUPER_KERNEL:
     _enable_superkernel()
@@ -247,8 +247,9 @@ def _ffn_norm_fake(x, weight, eps):
 class MhcFfnPreBlock(nn.Module):
     """One layer of the Attention-output + FFN-preprocessing fragment."""
 
-    def __init__(self, hidden: int, seed: int = 0):
+    def __init__(self, hidden: int, seed: int = 0, layer_idx: int = 0):
         super().__init__()
+        self.layer_idx = layer_idx
         generator = torch.Generator().manual_seed(seed)
         self.register_buffer(
             "fn",
@@ -275,7 +276,13 @@ class MhcFfnPreBlock(nn.Module):
         num_tokens = batch * seq
         mhc_hidden = MHC * hidden
 
+        if ENABLE_SUPER_KERNEL and self.layer_idx == 0:
+            torch.npu.super_kernel_scope_begin(None)
+
         post = mhc_post_op(x, residual, post_layer_mix, comb_res_mix)
+
+        if ENABLE_SUPER_KERNEL and self.layer_idx == 0:
+            torch.npu.super_kernel_scope_end(None)
         post_flat = post.view(num_tokens, mhc_hidden)
 
         if ENABLE_SUPER_KERNEL:
@@ -302,7 +309,9 @@ class MhcFfnPreBlock(nn.Module):
             2.0,
             1e-2,
         )
+
         comb_out = mhc_sinkhorn_op(comb_next.view(num_tokens, MHC, MHC), 10, 1e-6)
+
         mixed = mhc_pre_apply_op(post.view(num_tokens, MHC, hidden), pre_mix)
         ffn_input = ffn_norm_op(
             mixed.view(batch, seq, hidden),
@@ -324,7 +333,7 @@ class Dsv41FlashMhcModel(nn.Module):
     def __init__(self, num_layers: int, hidden: int, seed: int = 0):
         super().__init__()
         self.blocks = nn.ModuleList(
-            [MhcFfnPreBlock(hidden, seed=seed + layer) for layer in range(num_layers)]
+            [MhcFfnPreBlock(hidden, seed=seed + layer, layer_idx=layer) for layer in range(num_layers)]
         )
 
     def forward(
