@@ -2,7 +2,7 @@
 
 本目录存放 DeepSeek V4.1 Flash 的 TileLang 模型片段示例。
 
-## deepseek-v4.1-flash
+## deepseek-v4.1-flash-ffnpre
 
 DeepSeek V4.1 Flash L0 的 **Attention 输出 + FFN 前处理** 片段。每层依次执行
 7 个 ops-tilelang 算子：
@@ -25,4 +25,11 @@ mhc_post_forward
 
 详细的模型片段说明、SK 开启方法、融合结构和性能数据见：
 
-**[deepseek-v4.1-flash/README.md](deepseek-v4.1-flash/README.md)**
+**[deepseek-v4.1-flash/ffnpre](deepseek-v4.1-flash/ffnpre/README.md)**
+
+
+## deepseek-v4.1-flash-localffn
+
+DeepSeek V4.1 Flash FFN GMM1 → SwiGLU → GMM2。  
+
+**[deepseek-v4.1-flash/localffn](deepseek-v4.1-flash/localffn/README.md)**

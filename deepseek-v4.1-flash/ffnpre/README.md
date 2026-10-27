@@ -20,6 +20,30 @@ dsv4.1-flash-attout-to-ffnpre-multilayer.py
 6. `mhc_pre_apply_mix_forward`：用 pre mix 把 4 路 mHC 压成 1 路；
 7. `norm_fn`（ffn_norm / RMSNorm）：输出 FFN 输入。
 
+
+ops-tilelang 算子仓
+```text
+https://gitcode.com/cann/ops-tilelang
+commit: ce4c30075c5836ee71d18bb8eb7663987ce580da
+```
+
+with small patch:
+```text
+diff --git a/src/cann_ops_tilelang/mhc/sinkhorn_kernel.py b/src/cann_ops_tilelang/mhc/sinkhorn_kernel.py
+index d69d137..164b881 100644
+--- a/src/cann_ops_tilelang/mhc/sinkhorn_kernel.py
++++ b/src/cann_ops_tilelang/mhc/sinkhorn_kernel.py
+@@ -6,7 +6,7 @@ _TOKEN_TILE = 64
+ _PASS_CONFIGS = {'tl.enable_fast_math': True}
+ 
+ 
+-@tilelang.jit(target='pto', pass_configs=_PASS_CONFIGS)
++@tilelang.jit
+ def mhc_sinkhorn_forward_kernel(
+     x,
+     out,
+```
+
 脚本把该片段改造成可循环的多层模型：
 
 ```python

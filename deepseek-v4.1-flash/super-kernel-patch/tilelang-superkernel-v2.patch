@@ -1,0 +1,838 @@
+diff --git a/src/ascend/codegen/codegen_ascend.cc b/src/ascend/codegen/codegen_ascend.cc
+--- a/src/ascend/codegen/codegen_ascend.cc
++++ b/src/ascend/codegen/codegen_ascend.cc
+@@ -540,7 +540,7 @@
+   LOG(FATAL) << "Cannot convert scalar type " << t << " to Ascend type";
+ }
+ 
+-void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
++void CodeGenTileLangAscend::PrepareFunction(const PrimFunc &f) {
+   ICHECK(IsOutsideVF())
+       << "Ascend VF mode leaked across PrimFunc code generation";
+   this->InitFuncState(f);
+@@ -659,7 +659,10 @@
+   } else {
+     kernel_mode_ = AscendKernelMode::kVector;
+   }
+-
++}
++
++void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
++  PrepareFunction(f);
+   auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
+   ICHECK(global_symbol) << "CodeGenTileLangAscend: Expect PrimFunc to have the "
+                            "global_symbol attribute";
+diff --git a/src/ascend/codegen/codegen_ascend.h b/src/ascend/codegen/codegen_ascend.h
+--- a/src/ascend/codegen/codegen_ascend.h
++++ b/src/ascend/codegen/codegen_ascend.h
+@@ -64,6 +64,10 @@
+                         PrimExpr rhs, std::ostream &os) final;
+ 
+ private:
++  friend class SuperKernelCodegen;
++  // Shared kernel-mode analysis, parameter scopes and per-function state.
++  void PrepareFunction(const PrimFunc &f);
++
+   struct CApiArgument {
+     PrimExpr value;
+     std::string prefix{};
+diff --git a/src/ascend/codegen/codegen_superkernel.h b/src/ascend/codegen/codegen_superkernel.h
+new file mode 100644
+--- /dev/null
++++ b/src/ascend/codegen/codegen_superkernel.h
+@@ -0,0 +1,18 @@
++#ifndef TVM_TL_ASCEND_CODEGEN_CODEGEN_SUPERKERNEL_H_
++#define TVM_TL_ASCEND_CODEGEN_CODEGEN_SUPERKERNEL_H_
++
++#include <tvm/ir/module.h>
++
++namespace tvm {
++namespace codegen {
++
++class CodeGenTileLangAscend;
++
++// Append optional SK entries after ordinary Ascend kernel code generation.
++// The module's ordinary functions and launch metadata are not modified.
++void EmitSuperKernel(const IRModule &mod, CodeGenTileLangAscend *codegen);
++
++} // namespace codegen
++} // namespace tvm
++
++#endif // TVM_TL_ASCEND_CODEGEN_CODEGEN_SUPERKERNEL_H_
+diff --git a/src/ascend/codegen/codegen_superkernel.cc b/src/ascend/codegen/codegen_superkernel.cc
+new file mode 100644
+--- /dev/null
++++ b/src/ascend/codegen/codegen_superkernel.cc
+@@ -0,0 +1,228 @@
++#include "codegen_superkernel.h"
++
++#include <cstdint>
++#include <sstream>
++#include <string>
++#include <unordered_set>
++
++#include <tvm/ir/transform.h>
++#include <tvm/tirx/builtin.h>
++#include <tvm/tirx/stmt_functor.h>
++
++#include "ascend/op/builtin.h"
++#include "codegen_ascend.h"
++#include "support/check.h"
++
++namespace tvm {
++namespace codegen {
++
++using namespace tirx;
++
++namespace {
++
++struct SuperKernelConfig {
++  bool enabled;
++  int num_variants;
++  uint64_t cap;
++};
++
++SuperKernelConfig ReadConfig() {
++  auto ctx = tvm::transform::PassContext::Current();
++  bool enabled =
++      ctx->GetConfig<Bool>(tl::kEnableSuperKernel, Bool(false)).value();
++  bool configured = ctx->config.count(tl::kSuperKernelNumVariants) ||
++                    ctx->config.count(tl::kSuperKernelDisableDcci);
++  ICHECK(enabled || !configured)
++      << "SuperKernel options require tl.ascend_enable_superkernel=True";
++  int64_t variants =
++      ctx->GetConfig<Integer>(tl::kSuperKernelNumVariants, Integer(4))
++          .value()->value;
++  ICHECK(variants >= 1 && variants <= 4)
++      << "tl.ascend_superkernel_num_variants must be in [1, 4]";
++  uint64_t cap =
++      ctx->GetConfig<Bool>(tl::kSuperKernelDisableDcci, Bool(false)).value()
++          ? uint64_t{4}
++          : uint64_t{0};
++  return {enabled, static_cast<int>(variants), cap};
++}
++
++void ValidateSymbols(const IRModule &mod) {
++  std::unordered_set<std::string> symbols;
++  for (const auto &kv : mod->functions) {
++    auto f = Downcast<PrimFunc>(kv.second);
++    if (auto name = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol)) {
++      symbols.insert(name.value());
++    }
++  }
++  for (const auto &name : symbols) {
++    ICHECK(!symbols.count(name + "_sk") && !symbols.count(name + "_sk_args"))
++        << "SuperKernel generated symbol collides with an existing global: "
++        << name;
++  }
++}
++
++// Change only the copied SK body. Task-context values become explicit IR vars,
++// so normal SIMD/SIMT capture analysis passes them to helpers automatically.
++class SkEntryRewriter : public StmtExprMutator {
++public:
++  SkEntryRewriter(Var index, Var count, bool vector)
++      : index_(index), count_(count), vector_(vector) {}
++
++  Stmt VisitStmt_(const AttrStmtNode *op) final {
++    // Imported declarations were already emitted with the ordinary entry.
++    if (op->attr_key == tirx::attr::pragma_import_c) {
++      return VisitStmt(op->body);
++    }
++    if (vector_ && op->attr_key == tirx::attr::thread_extent) {
++      if (const auto *iv = op->node.as<IterVarNode>();
++          iv && iv->thread_tag == "blockIdx.x") {
++        PrimExpr index = index_;
++        if (iv->var.dtype() != index_.dtype()) {
++          index = Cast(iv->var.dtype(), index_);
++        }
++        return Substitute(VisitStmt(op->body), {{iv->var, index}});
++      }
++    }
++    return StmtExprMutator::VisitStmt_(op);
++  }
++
++  PrimExpr VisitExpr_(const CallNode *op) final {
++    if ((op->op.same_as(builtin::call_extern()) ||
++         op->op.same_as(builtin::call_pure_extern())) && op->args.size() == 1) {
++      if (const auto *symbol = op->args[0].as<StringImmNode>()) {
++        if (symbol->value == "AscendC::GetBlockNum" ||
++            symbol->value == "asc_get_block_num") {
++          return Cast(op->dtype, count_);
++        }
++        if (vector_ && (symbol->value == "AscendC::GetBlockIdx" ||
++                        symbol->value == "asc_get_block_idx")) {
++          return Cast(op->dtype, index_);
++        }
++      }
++    }
++    return StmtExprMutator::VisitExpr_(op);
++  }
++
++private:
++  Var index_, count_;
++  bool vector_;
++};
++
++} // namespace
++
++// This emitter is the only SK-specific client of ordinary codegen state. It
++// reuses type printing, kernel preparation and body emission without adding an
++// SK mode to the ordinary generator or its statement/expression visitors.
++class SuperKernelCodegen {
++public:
++  static void Generate(const IRModule &mod, CodeGenTileLangAscend *cg) {
++    const auto config = ReadConfig();
++    if (!config.enabled) {
++      return;
++    }
++    ValidateSymbols(mod);
++    std::ostringstream preamble;
++    preamble << "#include <kernel_operator.h>\n"
++             << cg->preamble_stream_.str();
++    cg->preamble_stream_.swap(preamble);
++    for (const auto &kv : mod->functions) {
++      auto f = Downcast<PrimFunc>(kv.second);
++      if (f->GetAttr<Integer>(tvm::attr::kCallingConv) ==
++          CallingConv::kDeviceKernelLaunch) {
++        EmitFunction(f, cg, config);
++      }
++    }
++  }
++
++private:
++  static void PrintParameterType(const Var &v, CodeGenTileLangAscend *cg,
++                                 std::ostream &os) {
++    if (v.dtype().is_handle()) {
++      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
++        ICHECK(ptr->storage_scope != "grid_constant")
++            << "SuperKernel does not support grid_constant parameters";
++      }
++      auto it = cg->alloc_storage_scope_.find(v.get());
++      if (it != cg->alloc_storage_scope_.end()) {
++        cg->PrintStorageScope(it->second, os);
++      }
++    }
++    cg->CodeGenC::PrintType(GetType(v), os);
++  }
++
++  static void EmitFunction(const PrimFunc &f, CodeGenTileLangAscend *cg,
++                           const SuperKernelConfig &config) {
++    cg->PrepareFunction(f);
++    const auto name = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol).value();
++    cg->current_function_name_ = std::string(name) + "_sk";
++    for (const char *symbol : {"tl_sk_args", "tl_sk_sys", "tl_sk_block_idx",
++                               "tl_sk_num_blocks"}) {
++      cg->name_supply_->ReserveName(symbol);
++    }
++    Var index("tl_sk_block_idx", DataType::Int(32));
++    Var count("tl_sk_num_blocks", DataType::Int(32));
++    cg->var_idmap_[index.get()] = "tl_sk_block_idx";
++    cg->var_idmap_[count.get()] = "tl_sk_num_blocks";
++    using KernelMode = CodeGenTileLangAscend::AscendKernelMode;
++    bool vector = cg->kernel_mode_ == KernelMode::kVector;
++    const char *qualifier =
++        vector ? "__vector__"
++               : (cg->kernel_mode_ == KernelMode::kCube
++                      ? "__cube__"
++                      : "__mix__(1, 2)");
++    auto &os = cg->stream;
++    os << "struct " << name << "_sk_args {\n";
++    for (size_t i = 0; i < f->params.size(); ++i) {
++      const Var &v = f->params[i];
++      ICHECK(v.dtype().is_scalar())
++          << "SuperKernel parameters must be scalar or pointers";
++      os << "  ";
++      if (!v.dtype().is_handle() && v.dtype().bits() < 32) {
++        os << "alignas(4) ";
++      }
++      PrintParameterType(v, cg, os);
++      os << " arg" << i << ";\n";
++    }
++    os << "};\n\ntemplate<uint32_t tl_sk_variant>\n"
++       << "__sk__ " << qualifier << " void " << name << "_sk(const "
++       << name << "_sk_args* tl_sk_args, sk::SkSystemArgs* tl_sk_sys) {\n"
++       << "  asc_init();\n  tl_sk_sys->SkInit();\n"
++       << "  const int32_t tl_sk_num_blocks = tl_sk_sys->SkGetNumBlocks();\n";
++    if (vector) {
++      os << "  const int32_t tl_sk_block_idx = tl_sk_sys->SkGetBlockIdx();\n";
++    }
++    bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
++    for (size_t i = 0; i < f->params.size(); ++i) {
++      const Var &v = f->params[i];
++      os << "  ";
++      PrintParameterType(v, cg, os);
++      if (v.dtype().is_handle() && no_alias) {
++        cg->PrintRestrict(v, os);
++      }
++      os << " " << cg->AllocVarID(v.get()) << " = tl_sk_args->arg" << i
++         << ";\n";
++      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
++        if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
++          cg->RegisterHandleType(v.get(), prim->dtype);
++        }
++      }
++    }
++    cg->CodeGenTileLangCBase::PreFunctionBody(f);
++    int scope = cg->BeginScope();
++    cg->PrintStmt(SkEntryRewriter(index, count, vector)(f->body));
++    cg->EndScope(scope);
++    ICHECK(cg->IsOutsideVF()) << "Ascend VF mode leaked after SK codegen";
++    os << "}\n\nSK_BIND(" << name << ", " << config.cap << "ULL";
++    for (int i = 0; i < config.num_variants; ++i) {
++      os << ", " << name << "_sk<" << i << ">";
++    }
++    os << ");\n\n";
++  }
++};
++
++void EmitSuperKernel(const IRModule &mod, CodeGenTileLangAscend *codegen) {
++  SuperKernelCodegen::Generate(mod, codegen);
++}
++
++} // namespace codegen
++} // namespace tvm
+diff --git a/src/ascend/codegen/rt_mod_ascend.cc b/src/ascend/codegen/rt_mod_ascend.cc
+--- a/src/ascend/codegen/rt_mod_ascend.cc
++++ b/src/ascend/codegen/rt_mod_ascend.cc
+@@ -1,4 +1,5 @@
+ #include "codegen_ascend.h"
++#include "codegen_superkernel.h"
+ #include "config.h"
+ 
+ #include "runtime/metadata.h"
+@@ -44,6 +45,7 @@
+     cg.AddFunction(f);
+   }
+ 
++  EmitSuperKernel(mod, &cg);
+   return cg.Finish();
+ }
+ 
+diff --git a/src/ascend/op/builtin.cc b/src/ascend/op/builtin.cc
+--- a/src/ascend/op/builtin.cc
++++ b/src/ascend/op/builtin.cc
+@@ -15,6 +15,10 @@
+ using namespace tirx;
+ 
+ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableAutoSchedule, Bool);
++TVM_REGISTER_PASS_CONFIG_OPTION(kEnableSuperKernel, Bool);
++TVM_REGISTER_PASS_CONFIG_OPTION(kSuperKernelNumVariants, Integer);
++TVM_REGISTER_PASS_CONFIG_OPTION(kSuperKernelDisableDcci, Bool);
++
+ 
+ // Emitted by tilelang.ascend.language.assume_conflict/assume_no_conflict and
+ // consumed by src/ascend/transform/normalize_conflict_hints.cc, so it lives
+diff --git a/src/ascend/op/builtin.h b/src/ascend/op/builtin.h
+--- a/src/ascend/op/builtin.h
++++ b/src/ascend/op/builtin.h
+@@ -14,6 +14,12 @@
+ // Ascend-specific pass configuration keys. Their string values remain stable
+ // because they are part of the Python PassContext interface.
+ static constexpr const char *kEnableAutoSchedule = "tl.enable_auto_schedule";
++
++static constexpr const char *kEnableSuperKernel = "tl.ascend_enable_superkernel";
++static constexpr const char *kSuperKernelNumVariants =
++    "tl.ascend_superkernel_num_variants";
++static constexpr const char *kSuperKernelDisableDcci =
++    "tl.ascend_superkernel_disable_dcci";
+ 
+ /*!
+  * \brief Marker op for user-declared auto-schedule conflict facts.
+diff --git a/tilelang/transform/pass_config.py b/tilelang/transform/pass_config.py
+--- a/tilelang/transform/pass_config.py
++++ b/tilelang/transform/pass_config.py
+@@ -75,6 +75,15 @@
+ 
+     TL_ENABLE_AUTO_SCHEDULE = "tl.enable_auto_schedule"
+     """Enable Ascend auto scheduling. Default: True."""
++
++    TL_ASCEND_ENABLE_SUPERKERNEL = "tl.ascend_enable_superkernel"
++    """Emit SK entries and SK_BIND for Ascend C kernels. Default: False."""
++
++    TL_ASCEND_SUPERKERNEL_NUM_VARIANTS = "tl.ascend_superkernel_num_variants"
++    """Number of equivalent SK entry symbols to bind (1 to 4). Default: 4."""
++
++    TL_ASCEND_SUPERKERNEL_DISABLE_DCCI = "tl.ascend_superkernel_disable_dcci"
++    """Disable DCCI ALL around SK calls (cap bit 2). Default: False."""
+ 
+     TL_ENABLE_AUTO_WARP_SPECIALIZATION = "tl.enable_auto_warp_specialization"
+     """Name of the automatic warp-specialization scheduler to run (e.g.
+diff --git a/tilelang/ascend/pipeline.py b/tilelang/ascend/pipeline.py
+--- a/tilelang/ascend/pipeline.py
++++ b/tilelang/ascend/pipeline.py
+@@ -34,6 +34,15 @@
+ 
+ 
+ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
++    from .target import target_is_pto
++
++    config = tilelang.transform.get_pass_context().config
++    sk_configured = any(
++        str(key).startswith("tl.ascend_superkernel_") or str(key) == "tl.ascend_enable_superkernel"
++        for key in config
++    )
++    if target_is_pto(target) and sk_configured:
++        raise ValueError("SuperKernel adaptation requires the Ascend C backend, not PTO")
+     mod = tirx.transform.BindTarget(target)(mod)
+     # Materialize the target-neutral kernel-launch nest emitted by T.Kernel.
+     # Ascend's NPU launch is a real 1-D blockIdx.x core grid, so the grid loop
+diff --git a/tilelang/ascend/README.md b/tilelang/ascend/README.md
+--- a/tilelang/ascend/README.md
++++ b/tilelang/ascend/README.md
+@@ -49,6 +49,11 @@
+ python -m pip install -r requirements-dev.txt
+ USE_ASCEND=ON USE_CUDA=OFF python -m pip install -e . -v --no-build-isolation
+ ```
++
++## SuperKernel
++
++For optional SK entry generation, binding capabilities, task-context rules and
++validation, see [SuperKernel adaptation](../../docs/ascend_superkernel.md).
+ 
+ ## Quick Start
+ 
+diff --git a/docs/ascend_superkernel.md b/docs/ascend_superkernel.md
+new file mode 100644
+--- /dev/null
++++ b/docs/ascend_superkernel.md
+@@ -0,0 +1,129 @@
++# Ascend 950 SuperKernel adaptation
++
++The Ascend C backend can emit SuperKernel (SK) subfunctions alongside its
++ordinary kernels. The ordinary launch ABI and TVM-FFI/ACL launch path stay the
++same. The caller registers the operator with Torch and enables graph fusion;
++TileLang does not directly launch the SK entry or enable framework fusion.
++
++## Enable generation
++
++For an existing PrimFunc `func`:
++
++```python
++import tilelang
++
++kernel = tilelang.compile(
++    func,
++    target="ascend",
++    execution_backend="tvm_ffi",
++    pass_configs={
++        tilelang.PassConfigKey.TL_ASCEND_ENABLE_SUPERKERNEL: True,
++    },
++)
++```
++
++Pass the same `pass_configs` dictionary to `@tilelang.jit` when using JIT
++compilation. Source-only lowering also honors the options through
++`tvm.transform.PassContext(config=...)`.
++
++Generation is disabled by default. When enabled, each device kernel retains its
++ordinary entry and gets an argument structure, a templated `__sk__` entry with
++`sk::SkSystemArgs*`, and `SK_BIND`. The template argument creates equivalent
++symbols, not different computations. Parameter fields follow the final device
++signature, including dynamic parameters; scalar fields smaller than four bytes
++use `alignas(4)`. Grid-constant by-value parameters are currently unsupported.
++
++## Task context
++
++| Kernel type | Block index | Runtime block count | Sub-block index |
++| --- | --- | --- | --- |
++| Vector | `SkGetBlockIdx()` | `SkGetNumBlocks()` | Original implementation |
++| Cube | Original implementation | `SkGetNumBlocks()` | Original implementation |
++| MIX 1:2 | Original implementation | `SkGetNumBlocks()` | Original implementation |
++
++The SK entry resolves task context before calling VF helpers. Pure Vector VF
++helpers receive the task index explicitly. Runtime queries written with
++`T.call_extern` to `AscendC::GetBlockNum` or `asc_get_block_num` use the SK count;
++Vector index queries to `AscendC::GetBlockIdx` or `asc_get_block_idx` use the SK
++index. Arbitrary imported C/C++ functions are not rewritten. Their authors must
++pass the required task context explicitly.
++
++`T.get_block_extent()` is a compile-time launch extent and retains its existing
++meaning. Hard-coded loop strides are not automatically turned into runtime
++counts. This matters when opting into grid expansion.
++
++The SK entry calls `asc_init()` and `SkSystemArgs::SkInit()`. The latter
++initializes the SDK early-start synchronization configuration. Existing
++computation, synchronization and hardware-state resets are retained. Imported
++helpers remain responsible for their own asynchronous resource and Cache
++contracts, including TPipe cleanup when applicable.
++
++## Binding options
++
++All keys below have the prefix `tl.ascend_` and corresponding
++`PassConfigKey.TL_ASCEND_*` enum members. Options apply to the kernels generated
++by one compilation. Supplying an SK-specific option without enabling SK is an
++error. The PTO backend rejects these options.
++
++| Key suffix | Default | Meaning |
++| --- | --- | --- |
++| `enable_superkernel` | `False` | Emit SK entries and bindings |
++| `superkernel_num_variants` | `4` | Bind 1 to 4 SK entry symbols |
++| `superkernel_disable_dcci` | `False` | Cap 4: suppress DCCI ALL around calls |
++
++Only these three options are exposed. `superkernel_disable_dcci=False` emits
++`cap=0`; setting it to `True` emits `cap=4`. Only disable DCCI when the kernel
++already guarantees GM cache consistency.
++
++## Code generation organization
++
++SuperKernel generation is a separate step after all ordinary Ascend entries
++have been emitted:
++
++```cpp
++for (...) {
++  cg.AddFunction(f);
++}
++EmitSuperKernel(mod, &cg);
++return cg.Finish();
++```
++
++`src/ascend/codegen/codegen_superkernel.cc` owns configuration validation, symbol
++checks, SK argument structures, entry signatures, task-context IR rewriting,
++parameter unpacking and `SK_BIND`. The ordinary generator only extracts its
++existing per-function setup into `PrepareFunction`, shared with the SK emitter.
++It has no SK mode flag or SK-specific statement/expression visitor branches.
++
++For pure Vector kernels the SK copy replaces block-index bindings with explicit
++IR variables. Ordinary VF capture analysis then passes task context to helpers.
++The source IR module and its ordinary launch metadata are not modified.
++
++## SDK and verification
++
++Use a CANN SDK that supports `__sk__`, `SK_BIND`, and the task-context methods on
++Ascend 950 (`dav-3510`). Public documentation and released SDK support tables can
++differ; source generation alone does not establish toolchain support.
++
++The existing device compile/link flow is used. `SK_BIND` emits `.ascend.meta`
++binding records; these and the SK entry symbols must survive the final device
++link. No host argument-packing or ordinary runtime launch change is required.
++
++Run the source and SDK artifact tests after building with `USE_ASCEND=ON`:
++
++```bash
++source /home/cann/9.3.0_1014/ascend-toolkit/set_env.sh
++python -m pytest testing/ascend/target/test_ascend_superkernel.py -q
++```
++
++`TILELANG_TEST_ASCEND_COMPILE_FLAGS` can supply toolchain-specific flags for SDK
++artifact tests. For example, when this Bisheng version is used on a host whose
++GCC 13 C++ headers fail to compile the SDK, select installed GCC 11 headers with
++`-nostdinc++` and the appropriate `-isystem` paths. This is a host toolchain
++setting, not a default TileLang compile option.
++
++On a 950 system, compare ordinary execution with SK generation off/on, then
++run two dependent Torch-registered operators through `npugraph_ex` with
++SuperKernel enabled. Check numerical results and inspect fusion logs/artifacts
++and device tasks to establish actual SK execution. Test different block counts,
++tails, dynamic parameters, MIX synchronization, and DCCI behavior separately.
++Speed changes alone do not prove fusion.
+diff --git a/testing/ascend/target/test_ascend_superkernel.py b/testing/ascend/target/test_ascend_superkernel.py
+new file mode 100644
+--- /dev/null
++++ b/testing/ascend/target/test_ascend_superkernel.py
+@@ -0,0 +1,253 @@
++"""SuperKernel entries preserve the normal launch ABI and task context."""
++
++import os
++import re
++import shutil
++import struct
++import subprocess
++
++import pytest
++
++import tilelang
++import tilelang.ascend.language as T
++from tilelang import tvm
++from tilelang.contrib import bisheng
++
++ENABLE = "tl.ascend_enable_superkernel"
++PREFIX = "tl.ascend_superkernel_"
++
++
++@pytest.fixture(autouse=True)
++def _target_context():
++    with tvm.target.Target("ascend"):
++        yield
++
++
++def _kernel(kind="vector", vf="simt"):
++    @T.prim_func
++    def main(A: T.Tensor((512,), "int32"), n: T.int32):
++        with T.Kernel(4) as bx:
++            if kind == "cube":
++                with T.Cube():
++                    A[bx] = T.Cast("int32", T.call_extern("int64", "AscendC::GetBlockNum")) + n
++            elif kind == "mix":
++                with T.Cube():
++                    A[bx] = T.Cast("int32", T.call_extern("int64", "AscendC::GetBlockNum")) + n
++                with T.Vector():
++                    with T.SimtVF(threads=32):
++                        for i in T.Parallel(32):
++                            A[128 + bx * 32 + i] = bx
++            elif vf == "simt":
++                count = T.Cast("int32", T.call_extern("int64", "AscendC::GetBlockNum"))
++                with T.SimtVF(threads=32):
++                    for i in T.Parallel(32):
++                        A[bx * 32 + i] = bx + count + n
++            else:
++                count = T.Cast("int32", T.call_extern("int64", "AscendC::GetBlockNum"))
++                with T.SimdVF():
++                    T.evaluate(T.call_extern("int32", "consume_context", bx, count))
++
++    return main
++
++
++def _source(func, **options):
++    config = {"tl.enable_auto_schedule": False, ENABLE: True, **{PREFIX + k: v for k, v in options.items()}}
++    with tvm.transform.PassContext(config=config):
++        return tilelang.lower(func, target="ascend").kernel_source
++
++
++def _sk_body(source):
++    return source.split("sk::SkSystemArgs* tl_sk_sys) {", 1)[1]
++
++
++def test_disabled_preserves_original_entry():
++    source = tilelang.lower(_kernel(), target="ascend").kernel_source
++    assert "__global__ __vector__" in source
++    assert "__sk__" not in source
++    assert "SK_BIND(" not in source
++    assert "tl_sk_sys" not in source
++
++
++@pytest.mark.parametrize("kind,qualifier", [("vector", "__vector__"), ("cube", "__cube__"), ("mix", "__mix__(1, 2)")])
++def test_task_context_by_kernel_kind(kind, qualifier):
++    source = _source(_kernel(kind))
++    assert f'extern "C" __global__ {qualifier}' in source
++    assert f"__sk__ {qualifier}" in source
++    body = _sk_body(source)
++    assert "tl_sk_sys->SkGetNumBlocks()" in body
++    assert "AscendC::GetBlockNum()" not in body
++    assert "tl_sk_sys->SkInit()" in body
++    if kind == "vector":
++        assert "tl_sk_sys->SkGetBlockIdx()" in body
++        assert " = block_idx" not in body
++        # The SIMT helper receives the SK index instead of using a physical builtin.
++        helper = re.search(r"__simt_vf__.*main_kernel_sk.*?\{(.*?)\n\}", source, re.S)
++        assert helper is not None
++        assert "tl_sk_block_idx" in helper.group(0)
++    else:
++        assert "tl_sk_sys->SkGetBlockIdx()" not in body
++        assert "block_idx" in body
++    assert source.count("SK_BIND(") == 1
++    assert "main_kernel_sk<3>" in source
++
++
++def test_simd_helper_captures_task_context():
++    source = _source(_kernel(vf="simd"))
++    assert "consume_context(tl_sk_block_idx" in source
++    assert "tl_sk_num_blocks" in source
++
++
++@pytest.mark.parametrize("count", [1, 2, 3, 4])
++@pytest.mark.parametrize("disable_dcci", [False, True])
++def test_variant_count_and_cap(count, disable_dcci):
++    source = _source(_kernel(), num_variants=count, disable_dcci=disable_dcci)
++    binding = source.split("SK_BIND(")[1]
++    assert f", {4 if disable_dcci else 0}ULL," in binding
++    assert binding.count("_sk<") == count
++
++
++@pytest.mark.parametrize("count", [-1, 0, 5])
++def test_invalid_variant_count(count):
++    with pytest.raises(tvm.error.InternalError, match=r"num_variants must be in \[1, 4\]"):
++        _source(_kernel(), num_variants=count)
++
++
++def test_options_require_enable():
++    with tvm.transform.PassContext(config={PREFIX + "disable_dcci": False}):
++        with pytest.raises(tvm.error.InternalError, match="require tl.ascend_enable_superkernel"):
++            tilelang.lower(_kernel(), target="ascend")
++
++
++def test_small_scalar_alignment_and_parameter_order():
++    @T.prim_func
++    def main(A: T.Tensor((8,), "int32"), flag: T.int8, value: T.int64, enabled: T.bool):
++        with T.Kernel(1) as bx:
++            A[bx] = T.Cast("int32", flag) + T.Cast("int32", value) + T.Cast("int32", enabled)
++
++    source = _source(main)
++    fields = re.search(r"struct main_kernel_sk_args \{(.*?)\};", source, re.S).group(1)
++    assert re.search(r"alignas\(4\) int8_t arg\d;", fields)
++    assert re.search(r"alignas\(4\) bool arg\d;", fields)
++    # Lowering may reorder scalar parameters. Match the final device ABI,
++    # rather than assuming the original Python parameter order survives.
++    signature = re.search(r"void main_kernel\(([^)]*)\)", source).group(1)
++    ordinary_types = [p.rsplit(" ", 1)[0].replace(" __restrict__", "") for p in signature.split(", ")]
++    field_types = [re.sub(r"alignas\(4\) ", "", line.strip()).rsplit(" ", 1)[0] for line in fields.splitlines() if line.strip()]
++    assert field_types == ordinary_types
++
++
++def test_dynamic_arguments_follow_device_signature():
++    rows = T.dynamic("rows")
++
++    @T.prim_func
++    def main(A: T.Tensor((rows,), "int32"), B: T.Tensor((rows,), "int32")):
++        with T.Kernel(T.ceildiv(rows, 32)) as bx:
++            with T.SimtVF(threads=32):
++                for i in T.Parallel(32):
++                    if bx * 32 + i < rows:
++                        B[bx * 32 + i] = A[bx * 32 + i]
++
++    source = _source(main)
++    signature = re.search(r"void main_kernel\(([^)]*)\)", source).group(1)
++    fields = re.search(r"struct main_kernel_sk_args \{(.*?)\};", source, re.S).group(1)
++    assert "rows" in signature
++    assert len(signature.split(", ")) == len([line for line in fields.splitlines() if line.strip()])
++    assert re.search(r"rows = tl_sk_args->arg\d", _sk_body(source))
++
++
++def test_pto_rejects_superkernel_options():
++    with tvm.transform.PassContext(config={ENABLE: True}):
++        with pytest.raises(ValueError, match="requires the Ascend C backend"):
++            tilelang.lower(_kernel(), target="pto")
++
++
++def test_registered_superkernel_options():
++    registered = {
++        str(key) for key in tvm.transform.PassContext.list_configs()
++        if str(key) == ENABLE or str(key).startswith(PREFIX)
++    }
++    assert registered == {ENABLE, PREFIX + "num_variants", PREFIX + "disable_dcci"}
++
++
++def test_imported_source_is_emitted_once():
++    @T.prim_func
++    def main(A: T.Tensor((8,), "int32")):
++        with T.Kernel(1, prelude="__aicore__ inline int imported_value() { return 7; }") as bx:
++            A[bx] = T.call_extern("int32", "imported_value")
++
++    source = _source(main)
++    assert source.count("inline int imported_value()") == 1
++    assert source.count("imported_value()") == 3
++
++
++def test_multiple_kernels_and_symbol_collision():
++    from tilelang.engine.lower import device_codegen_without_compile
++    from tilelang.backend import create_backend_context
++
++    context = create_backend_context("ascend", execution_backend="tvm_ffi")
++    with tvm.transform.PassContext(config={ENABLE: True, "tl.enable_auto_schedule": False}):
++        device = tilelang.lower(_kernel(), target="ascend").device_mod
++        func = next(iter(device.functions.values()))
++        mod = tvm.IRModule({
++            "left": func.with_attr("global_symbol", "left"),
++            "right": func.with_attr("global_symbol", "right"),
++        })
++        source = device_codegen_without_compile(mod, context).inspect_source()
++        assert "SK_BIND(left," in source
++        assert "SK_BIND(right," in source
++        assert source.count("sk::SkSystemArgs* tl_sk_sys") == 2
++        collision = tvm.IRModule({
++            "left": func.with_attr("global_symbol", "left"),
++            "left_sk": func.with_attr("global_symbol", "left_sk"),
++        })
++        with pytest.raises(tvm.error.InternalError, match="generated symbol collides"):
++            device_codegen_without_compile(collision, context)
++
++
++@pytest.mark.parametrize("kind", ["vector", "cube", "mix"])
++@pytest.mark.parametrize("disable_dcci", [False, True])
++def test_sdk_binary_keeps_sk_binding(kind, disable_dcci, tmp_path):
++    if shutil.which("bisheng") is None or shutil.which("readelf") is None:
++        pytest.skip("CANN bisheng and readelf are required")
++    source = _source(_kernel(kind), disable_dcci=disable_dcci)
++    binary = bisheng.compile_ascend(
++        source,
++        target_format="aibin",
++        options=["-I" + tilelang.env.TILELANG_TEMPLATE_PATH, *bisheng.normalize_options(os.getenv("TILELANG_TEST_ASCEND_COMPILE_FLAGS"))],
++    )
++    path = tmp_path / "kernel.aibin"
++    path.write_bytes(binary)
++    sections = subprocess.check_output(["readelf", "-SW", str(path)], text=True)
++    assert ".ascend.meta" in sections
++    symbols = subprocess.check_output(["readelf", "-Ws", str(path)], text=True)
++    symbols = subprocess.check_output(["c++filt"], input=symbols, text=True)
++    for i in range(4):
++        assert f"main_kernel_sk<{i}u>" in symbols
++    assert "main_kernel" in symbols
++    # Check the linked addresses, not only the existence of a metadata section.
++    dump = subprocess.check_output(["readelf", "-x", ".ascend.meta", str(path)], text=True)
++    chunks = re.findall(r"^\s+0x[0-9a-f]+((?: [0-9a-f]{8}){1,4})", dump, re.M)
++    data = bytes.fromhex("".join(chunks))
++    functions = {}
++    for line in symbols.splitlines():
++        fields = line.split(maxsplit=7)
++        if len(fields) == 8 and fields[3] == "FUNC":
++            functions[int(fields[1], 16)] = fields[7]
++    offset = 0
++    records = 0
++    while offset + 4 <= len(data):
++        kind_id, size = struct.unpack_from("<HH", data, offset)
++        if kind_id == 5:  # SDK B_TYPE_SK_INFO; BaseTlv + reserved uint32_t.
++            cap, ordinary, *entries = struct.unpack_from("<6Q", data, offset + 8)
++            assert cap == (4 if disable_dcci else 0)
++            name = functions[ordinary]
++            assert name in {"main_kernel", "main_kernel_mix_aic", "main_kernel_mix_aiv"}
++            for i, address in enumerate(entries):
++                assert f"main_kernel_sk<{i}u>" in functions[address]
++                if name.endswith("_mix_aic"):
++                    assert "[clone .cube]" in functions[address]
++                elif name.endswith("_mix_aiv"):
++                    assert "[clone .vector]" in functions[address]
++            records += 1
++        offset += 4 + size
++    assert records > 0
+diff --git a/testing/ascend/runtime/test_superkernel_ordinary_launch.py b/testing/ascend/runtime/test_superkernel_ordinary_launch.py
+new file mode 100644
+--- /dev/null
++++ b/testing/ascend/runtime/test_superkernel_ordinary_launch.py
+@@ -0,0 +1,47 @@
++"""SK generation must preserve normal TVM-FFI execution on an Ascend device."""
++
++import os
++
++import pytest
++import torch
++
++import tilelang
++from tilelang.ascend import language as T
++from tilelang.contrib.bisheng import normalize_options
++
++pytest.importorskip("torch_npu")
++ROWS = T.dynamic("rows")
++
++
++@T.prim_func
++def add_bias(A: T.Tensor((ROWS,), T.int32), B: T.Tensor((ROWS,), T.int32), bias: T.int32):
++    with T.Kernel(T.ceildiv(ROWS, 32)) as bx:
++        count = T.Cast("int32", T.call_extern("int64", "asc_get_block_num"))
++        with T.SimtVF(threads=32):
++            for i in T.Parallel(32):
++                idx = bx * 32 + i
++                if idx < ROWS:
++                    B[idx] = A[idx] + bias + count
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++@pytest.mark.parametrize("rows", [1, 125, 256])
++def test_ordinary_launch(enabled, rows):
++    if not torch.npu.is_available():
++        pytest.skip("an available Ascend NPU is required")
++    kernel = tilelang.compile(
++        add_bias,
++        target="ascend",
++        execution_backend="tvm_ffi",
++        out_idx=1,
++        pass_configs={
++            "tl.enable_auto_schedule": False,
++            "tl.ascend_enable_superkernel": enabled,
++            "tl.device_compile_flags": normalize_options(os.getenv("TILELANG_TEST_ASCEND_COMPILE_FLAGS")),
++        },
++    )
++    host_source = torch.arange(rows, dtype=torch.int32)
++    source = host_source.to("npu")
++    result = kernel(source, 7)
++    torch.npu.synchronize()
++    torch.testing.assert_close(result.cpu(), host_source + 7 + (rows + 31) // 32)
