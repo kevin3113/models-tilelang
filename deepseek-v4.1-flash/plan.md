@@ -24,4 +24,5 @@
 
 - [支持batchmode 3614](https://github.com/tile-ai/tilelang/pull/3614)  
 - [PTO后端切换ffi 3516](https://github.com/tile-ai/tilelang/pull/3516)  
-- AIV拷出Schedule优化 [3616](https://github.com/tile-ai/tilelang/issues/3616) [3668](https://github.com/tile-ai/tilelang/pull/3668)  
+- AIV拷出Schedule优化 [3616](https://github.com/tile-ai/tilelang/issues/3616) [3668](https://github.com/tile-ai/tilelang/pull/3668)   
+- [自动调优适配 3546](https://github.com/tile-ai/tilelang/pull/3546)  
