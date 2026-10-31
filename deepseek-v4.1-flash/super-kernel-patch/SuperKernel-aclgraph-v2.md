@@ -26,19 +26,16 @@ ACL graph For SK 执行流程：
 - SK 生成一个 `__sk__` 入口，参数通过 `sk::SkSystemArgs*` 和 `_sk_args` 结构体传入；
 - 入口调用 `asc_init()`、`SkSystemArgs::SkInit()`，用 `SkGetNumBlocks()` 获取本次
   可用的 block 数，再用 `SkGetBlockIdx()` 做 task 级索引；
+  
+  | Kernel type | Block index | Runtime block count | Sub-block index |
+  | --- | --- | --- | --- |
+  | Vector | `SkGetBlockIdx()` | `SkGetNumBlocks()` | Original implementation |
+  | Cube | Original implementation | `SkGetNumBlocks()` | Original implementation |
+  | MIX 1:2 | Original implementation | `SkGetNumBlocks()` | Original implementation |
+  
 - 同一份计算绑定 1–4 个 SK 变体（`SK_BIND`），运行时按实际可用 block 数选择；
 - 合并后的 kernel 内部完成必要同步，减少 task 边界、进行指令和数据预取优化；
 - 算子计算逻辑本身不会，收益主要来自**调度开销的减少、预取相关优化**。
-
-### 1.3 ACL graph 中的 SK
-
-图模式下 SK 分两层：
-
-1. **算子侧**：给 kernel 生成 SK 入口和 `SK_BIND` 绑定（`__sk__`、`.ascend.meta`），
-   普通 launch ABI 不变；
-2. **torch_npu npugraph_ex 侧**：`super_kernel_optimize=True` 的 pass 根据
-   `torch.npu.super_kernel_scope_begin/end` 划分的 scope，把可融合的算子组合成
-   SuperKernel task。
 
 ## 2. TileLang 适配 SuperKernel 的 patch 修改
 
@@ -104,6 +101,21 @@ EmitSuperKernel(mod, &cg);
 - `SkEntryRewriter` 把纯 Vector kernel 的 block-index 绑定替换成显式 IR 变量，
   再把 task context 传给 VF helper；
 - 源 IR module 和普通 launch metadata 不变。
+
+### 2.3 生成代码样例  
+```cpp
+__global__ __vector__ void swiglu(...) {
+}
+
+template <int variant>
+__sk__ __vector__ void swiglu_sk(...) {
+}
+
+SK_BIND(swiglu, 0, swiglu_sk<0>, swiglu_sk<1>, swiglu_sk<2>, swiglu_sk<3>);
+```
+
+- [完整swiglu样例](codegen_with_sk.cpp)  
+
 
 ## 3. dsv4.1-flash 模型片段测试
 
